@@ -1,138 +1,121 @@
-export const config = { runtime: "edge" };
-
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const META_TOKEN = process.env.META_TOKEN;
-const WABA_PHONE_NUMBER_ID = process.env.WABA_PHONE_NUMBER_ID;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-function ok(body = "OK") {
-  return new Response(body, { status: 200 });
-}
-function bad(msg = "Forbidden") {
-  return new Response(msg, { status: 403 });
-}
-
-// Basit arıcılık anahtar kelime filtresi
-const BEE_KEYWORDS = [
-  "arı", "arıcılık", "kovan", "bal", "oğul", "ana arı", "varroa",
-  "kat atma", "besleme", "şurup", "temel petek", "kışlatma",
-  "nektar", "polen", "ruşet", "kek", "çerçeve", "memesi", "çıta"
-];
-
-function isBeekeeping(text) {
-  const t = (text || "").toLowerCase().normalize("NFKD");
-  return BEE_KEYWORDS.some(k => t.includes(k));
-}
+// api/webhook.js
+const META_TOKEN      = process.env.META_TOKEN;
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN || 'aricilik123';
+const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; // ÖRN: 855469457640686
 
 async function sendWhatsAppText(to, text) {
-  const url = `https://graph.facebook.com/v23.0/${WABA_PHONE_NUMBER_ID}/messages`;
-  const payload = {
+  const url = `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`;
+  const body = {
     messaging_product: "whatsapp",
     to,
     type: "text",
     text: { body: text }
   };
-  const res = await fetch(url, {
+
+  const r = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${META_TOKEN}`,
+      "Authorization": `Bearer ${META_TOKEN}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(body)
   });
-  // Hata olursa logla
-  if (!res.ok) {
-    const e = await res.text().catch(() => "");
-    console.error("WA send error:", res.status, e);
+
+  if (!r.ok) {
+    const err = await r.text();
+    console.error("WA send error:", r.status, err);
   }
 }
 
 async function askOpenAI(prompt) {
-  const res = await fetch("https://api.openai.com/v1/responses", {
+  // OpenAI çağrısı: Bakiye yoksa 429 dönebilir -> try/catch
+  const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: "gpt-5-nano",
-      input: prompt
+      model: "gpt-5-mini",
+      input: prompt,
     })
   });
 
-  if (!res.ok) {
-    const e = await res.text().catch(() => "");
-    console.error("OpenAI error:", res.status, e);
-    return null;
+  if (!r.ok) {
+    const err = await r.text();
+    throw new Error(`OpenAI error ${r.status}: ${err}`);
   }
 
-  const data = await res.json();
-  // responses API: output_text (tek string) alanı döner
-  return data.output_text || "";
+  const data = await r.json();
+  // Responses API: çıktı text'i genelde data.output_text veya choices benzeri döner.
+  // Emniyetli erişim:
+  return data.output_text?.trim() ||
+         data.choices?.[0]?.message?.content?.trim() ||
+         "Kısa bir yanıt üretemedim.";
 }
 
-export default async function handler(req) {
-  // 1) GET — webhook doğrulama
-  if (req.method === "GET") {
-    const { searchParams } = new URL(req.url);
-    const mode = searchParams.get("hub.mode");
-    const token = searchParams.get("hub.verify_token");
-    const challenge = searchParams.get("hub.challenge");
-    if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      return ok(challenge || "OK");
-    }
-    return bad("Token mismatch");
-  }
+module.exports = async (req, res) => {
+  try {
+    if (req.method === "GET") {
+      // Webhook doğrulama
+      const mode = req.query["hub.mode"];
+      const token = req.query["hub.verify_token"];
+      const challenge = req.query["hub.challenge"];
 
-  // 2) POST — mesaj işleme
-  if (req.method === "POST") {
-    let body;
-    try {
-      body = await req.json();
-    } catch {
-      return ok(); // Meta bazen boş ping atabiliyor
+      if (mode === "subscribe" && token === VERIFY_TOKEN) {
+        return res.status(200).send(challenge);
+      }
+      return res.status(403).send("Forbidden");
     }
 
-    try {
-      const entry = body?.entry?.[0];
-      const changes = entry?.changes?.[0];
-      const value = changes?.value;
-      const messages = value?.messages;
+    if (req.method === "POST") {
+      const body = req.body;
 
-      if (Array.isArray(messages) && messages.length > 0) {
-        const msg = messages[0];
-        const from = msg.from;                 // gönderen (telefon)
-        const type = msg.type;
+      // Webhook ping'lerini yanıtla
+      if (body?.object !== "whatsapp_business_account") {
+        return res.status(200).send("ignored");
+      }
 
-        if (type === "text") {
-          const text = msg.text?.body || "";
+      // Gelen mesajı yakala
+      const entry = body.entry?.[0];
+      const change = entry?.changes?.[0];
+      const value = change?.value;
+      const msg = value?.messages?.[0];
 
-          // Arıcılık filtresi
-          if (!isBeekeeping(text)) {
-            await sendWhatsAppText(
-              from,
-              "Şu an sadece **arıcılık** ile ilgili soruları yanıtlayabilirim. Arıcılık hakkında bir şey sormayı dener misin?"
-            );
-            return ok("EVENT_RECEIVED");
-          }
+      if (!msg || msg.type !== "text") {
+        return res.status(200).send("no-text");
+      }
 
-          // OpenAI'dan yanıt al
-          const prompt = `Sen arıcılık danışmanısın. Kısa ve net, teknik doğruluğu yüksek yanıt ver.
-Soru: ${text}
-Yanıt:`;
-          const ai = await askOpenAI(prompt);
+      const from = msg.from;          // Gönderenin WhatsApp numarası (ülke kodlu)
+      const text = msg.text?.body || "";
 
-          const answer = ai?.trim() || "Sorunu tam anlayamadım. Arıcılık hakkında biraz daha detay verebilir misin?";
-          await sendWhatsAppText(from, answer);
+      // Basit filtre: sadece arıcılık konuları
+      const isBee = /arı|arıcılık|kovan|bal|ana arı|oğul|varroa|nektar|polen|kovan/i.test(text);
+
+      let reply;
+      if (!isBee) {
+        reply = "Bu hat yalnızca arıcılıkla ilgili sorulara yanıt veriyor 🐝 Lütfen arıcılıkla ilgili bir soru sor.";
+      } else {
+        // OpenAI dene; hata olursa fallback
+        try {
+          reply = await askOpenAI(
+            `Sadece arıcılık alanında kısa, net ve Türkçe yanıt ver. Soru: ${text}`
+          );
+        } catch (e) {
+          console.error(e.message);
+          reply = "Şu an yoğunluktan dolayı yapay zekâ yanıtı veremiyorum. " +
+                  "Kısa bir süre sonra tekrar dener misin? 🐝";
         }
       }
-    } catch (e) {
-      console.error("Webhook handle error:", e);
-      // Meta'ya 200 döndürmek, tekrar tekrar denemesini engeller
+
+      await sendWhatsAppText(from, reply);
+      return res.status(200).send("ok");
     }
 
-    return ok("EVENT_RECEIVED");
+    return res.status(405).send("Method Not Allowed");
+  } catch (e) {
+    console.error("Webhook fatal error:", e);
+    return res.status(500).send("server error");
   }
-
-  return new Response("Method Not Allowed", { status: 405 });
-}
+};
