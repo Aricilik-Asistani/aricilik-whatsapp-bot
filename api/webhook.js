@@ -1,57 +1,89 @@
-// api/webhook.js — Vercel Serverless Function
-export default async function handler(req, res) {
-  // KENDİ DEĞERLERİN:
-  const VERIFY_TOKEN = "verify_token";       // Meta paneline yazacağınla birebir aynı olmalı
-  const WHATSAPP_TOKEN = "EAAXXX...";        // (Doğrulama için şart değil, ama sonra lazım)
-  const PHONE_NUMBER_ID = "855469457640686"; // (Doğrulama için şart değil)
+import express from "express";
+import fetch from "node-fetch";
+import OpenAI from "openai";
 
-  // 1) Meta doğrulama (GET)
-  if (req.method === "GET") {
-    const mode = req.query["hub.mode"];
-    const token = "EAALmtJ8XTpEBPUXmamOrc09TgxUZAfEv52zRL23uubzf1ovG1PEsRPBfqjdA3lmDOsZC468zvyIAlcZACoSgJLe0CJHWUAWakxI5ZCcXeWXP6d1sPqY46KXeXiwUAMARldOBVo3Fl2OFZC9ki1rzaZC1DZCp1bObOfzTn1uVrXKjV6hHQfWSIcylLXWZAyf7UL9ABEl4ZBWTbHrRlQfvZBJZAnGjzEVvZBoZCTJh82Ix6ZCQxsAHYWOQZDZD";
+const app = express();
+app.use(express.json());
 
-    const challenge = req.query["hub.challenge"];
+// Meta (Facebook) ayarları
+const VERIFY_TOKEN = "aricilik_verify_123"; // Facebook Webhook için
+const PAGE_ACCESS_TOKEN = "EAALmtJ8XTpEBPY2NxP2j8vOA6ekUya2kMqWceycM1hihr2Jx94PLL4tMAr52ZAd5hAcAqgN9acAwB7GmZAZC2xKXZB8Dft3LwthbOZC2Jim9QETuZCZCelMOYzZCZAcw1q7DGMR9VCLwunK5qsmIdYZCvYUt9ao4WtsDPJvzi5c5jJzygqXELLiJdZB96ZA0GK5WpQ7wVAsIAfgZCH8v1UZCIrZBUMueujbgNNRs2Qjpx60YKHmBzE5LcMZD"; 
 
-    if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      return res.status(200).send(challenge);
-    }
-    return res.status(403).send("Verification failed");
+// OpenAI ayarları
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// Webhook doğrulama (Meta çağırıyor)
+app.get("/api/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("✅ Webhook doğrulandı!");
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
   }
+});
 
-  // 2) Mesaj alma ve basit cevap (POST)
-  if (req.method === "POST") {
-    try {
-      const entry = req.body?.entry?.[0]?.changes?.[0]?.value;
-      const messages = entry?.messages || [];
-      if (!messages.length) return res.status(200).json({ ok: true });
+// Mesaj alıp cevaplama
+app.post("/api/webhook", async (req, res) => {
+  try {
+    const body = req.body;
 
-      const msg = messages[0];
-      const from = msg.from;
-      const text = msg.text?.body || "";
+    if (body.object === "whatsapp_business_account") {
+      const entry = body.entry?.[0];
+      const changes = entry?.changes?.[0];
+      const message = changes?.value?.messages?.[0];
 
-      // Basit karşılama — istersen sonra akıllandırırız
-      const reply = "🐝 Merhaba! Ben Arıcılık Asistanıyım. Sorunu yaz, yardımcı olayım.";
+      if (message && message.text) {
+        const from = message.from; // gönderen numara
+        const userMessage = message.text.body;
 
-      // WhatsApp’a yanıt (doğrulama için şart değil)
-      await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to: from,
-          type: "text",
-          text: { body: reply }
-        })
-      });
+        console.log("📩 Gelen mesaj:", userMessage);
 
-      return res.status(200).json({ sent: true });
-    } catch (e) {
-      return res.status(500).json({ error: String(e) });
+        // Arıcılıkla ilgili değilse cevap verme
+        if (!userMessage.toLowerCase().includes("arı")) {
+          console.log("❌ Arıcılık dışı mesaj, cevap gönderilmiyor.");
+          return res.sendStatus(200);
+        }
+
+        // OpenAI’den yanıt al
+        const completion = await openai.responses.create({
+          model: "gpt-5-mini",
+          input: `Sadece arıcılıkla ilgili asistan gibi cevap ver. Kullanıcı sorusu: ${userMessage}`,
+        });
+
+        const reply = completion.output[0].content[0].text;
+        console.log("🤖 Yanıt:", reply);
+
+        // WhatsApp API’ye gönder
+        await fetch(
+          `https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${PAGE_ACCESS_TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              messaging_product: "whatsapp",
+              to: from,
+              type: "text",
+              text: { body: reply },
+            }),
+          }
+        );
+      }
     }
-  }
 
-  return res.status(405).send("Method Not Allowed");
-}
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("❌ Hata:", error);
+    res.sendStatus(500);
+  }
+});
+
+export default app;
