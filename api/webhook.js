@@ -8,7 +8,8 @@ export default async function handler(req, res) {
   // 1) Meta doğrulama (GET)
   if (req.method === "GET") {
     const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
+    const token = "EAALmtJ8XTpEBPavxvDFwCynfxMI69TD0d7XZBg9xVdnOFSNsQG5Y16txUIE5nLmt0WHIml0k7W2ZCxSLOV2lHXqQZC2D4I9ymc24byrGbYrCMyn4ukZCaBqB8WZCSnLgAbHbbhIeR2WSlujZBtv4AtgeuydT0EltVKH2cC8vzRtxKO6fZAsfEPFEq6hFPRagCPBLlqZCx4zK3p61lbeXZAHG7xZBycRoDDpkRXA1SiKB95bsgpQTAZD";
+
     const challenge = req.query["hub.challenge"];
 
     if (mode === "subscribe" && token === VERIFY_TOKEN) {
