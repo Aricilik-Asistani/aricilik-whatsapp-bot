@@ -1,86 +1,69 @@
+// index.js
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
 
 const app = express().use(bodyParser.json());
 
-// Meta’dan aldığın Access Token ve Telefon ID’yi buraya yaz
-const token = "BURAYA_ACCESS_TOKEN";
-const phoneNumberId = "BURAYA_PHONE_NUMBER_ID";
+// 🔐 Bu üç satırı KENDİ DEĞERLERİNLE doldur:
+const VERIFY_TOKEN = "verify_token";                 // Meta paneline yazacağınla birebir aynı
+const WHATSAPP_TOKEN = "EAAXXX...";                  // Access Token (Generate access token ile aldığın)
+const PHONE_NUMBER_ID = "855469457640686";           // API Setup'taki Phone Number ID
 
-// Ana route
-app.get("/", (req, res) => {
-  res.send("Arıcılık Asistanı WhatsApp Botu Çalışıyor 🚀");
-});
+// Sağlık kontrolü (isteğe bağlı)
+app.get("/", (_, res) => res.send("Arıcılık Asistanı webhook hazır ✅"));
 
-// Webhook doğrulama
+// 1) Meta webhook DOĞRULAMA (GET)
 app.get("/webhook", (req, res) => {
-  let verify_token = "aricilik_verify_token"; // istediğin özel bir kelime olabilir
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
 
-  let mode = req.query["hub.mode"];
-  let token = req.query["hub.verify_token"];
-  let challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("WEBHOOK_VERIFIED");
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
 
-  if (mode && token) {
-    if (mode === "subscribe" && token === verify_token) {
-      console.log("Webhook doğrulandı!");
-      res.status(200).send(challenge);
-    } else {
-      res.sendStatus(403);
-    }
+// 2) Mesaj ALMA ve CEVAP gönderme (POST)
+app.post("/webhook", async (req, res) => {
+  try {
+    const entry = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const messages = entry?.messages || [];
+    if (messages.length === 0) return res.sendStatus(200);
+
+    const msg = messages[0];
+    const from = msg.from;                      // "9053..." formatlı numara
+    const text = msg.text?.body || "";          // kullanıcının yazdığı
+
+    console.log("GELEN:", from, text);
+
+    // Basit karşılama cevabı
+    const reply = "🐝 Merhaba! Ben Arıcılık Asistanıyım. Arıcılıkla ilgili sorun varsa yazabilirsin.";
+
+    await axios.post(
+      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: from,
+        type: "text",
+        text: { body: reply }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("Webhook error:", e?.response?.data || e.message);
+    return res.sendStatus(500);
   }
 });
 
-// Mesajları alma ve cevap verme
-app.post("/webhook", (req, res) => {
-  let body = req.body;
-
-  if (body.object) {
-    if (
-      body.entry &&
-      body.entry[0].changes &&
-      body.entry[0].changes[0].value.messages &&
-      body.entry[0].changes[0].value.messages[0]
-    ) {
-      let message = body.entry[0].changes[0].value.messages[0];
-      let from = message.from; // mesajı gönderen numara
-      let text = message.text.body; // mesajın içeriği
-
-      console.log(`Mesaj geldi: ${text}`);
-
-      // Cevap gönder
-      sendMessage(from, "🐝 Merhaba! Ben Arıcılık Asistanıyım. Bana arıcılık ile ilgili sorular sorabilirsin.");
-    }
-    res.sendStatus(200);
-  } else {
-    res.sendStatus(404);
-  }
-});
-
-// WhatsApp API ile mesaj gönderme
-function sendMessage(to, message) {
-  axios({
-    method: "POST",
-    url: `https://graph.facebook.com/v18.0/${phoneNumberId}/messages`,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    data: {
-      messaging_product: "whatsapp",
-      to: to,
-      text: { body: message },
-    },
-  })
-    .then((res) => {
-      console.log("Mesaj gönderildi:", res.data);
-    })
-    .catch((err) => {
-      console.error("Mesaj gönderilemedi:", err.response ? err.response.data : err);
-    });
-}
-
-// Sunucuyu çalıştır
-app.listen(3000, () => {
-  console.log("✅ Bot 3000 portunda çalışıyor");
-});
+// Vercel’de local port dinlemek sorun olmaz; sadece development için kullanılır.
+app.listen(3000, () => console.log("✅ Webhook yerel 3000'de hazır (Vercel prod'da serverless)."));
