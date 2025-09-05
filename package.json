@@ -2,16 +2,11 @@
   "name": "aricilik-whatsapp-bot",
   "version": "1.0.0",
   "description": "Arıcılık Asistanı - WhatsApp botu",
-  "main": "api/webhook.js",
-  "scripts": {
-    "start": "node api/webhook.js"
+  "type": "module",
+  "engines": {
+    "node": "22.x"
   },
   "dependencies": {
-    "openai": "^4.0.0",
-    "node-fetch": "^3.3.2"
-  },
-  "engines": {
-    "node": "18.x"
-  },
-  "license": "MIT"
+    "openai": "^4.56.0"
+  }
 }
