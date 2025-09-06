@@ -1,12 +1,9 @@
 {
-  "name": "aricilik-whatsapp-bot",
-  "version": "1.0.0",
-  "description": "Beekeeper Buddy - Arıcılık WhatsApp Botu",
-  "type": "module",
-  "engines": {
-    "node": "22.x"
-  },
-  "dependencies": {
-    "openai": "^4.56.0"
-  }
+  "version": 2,
+  "routes": [
+    {
+      "src": "/api/webhook",
+      "dest": "/api/webhook.js"
+    }
+  ]
 }
