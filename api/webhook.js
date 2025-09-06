@@ -1,133 +1,114 @@
-// /api/webhook.js
+import express from "express";
+import bodyParser from "body-parser";
+import fetch from "node-fetch";
 import OpenAI from "openai";
 
-// --- ENV ---
+const app = express();
+app.use(bodyParser.json());
+
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const META_TOKEN = process.env.META_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Basit konu filtresi: arıcılık dışı ise kısayol cevabı
-function isBeeTopic(text = "") {
-  const kws = [
-    "arı", "kovan", "bal", "oğul", "ana arı", "işçi arı",
-    "varroa", "nektar", "arıcılık", "yavru", "koloni"
-  ];
-  const t = text.toLocaleLowerCase("tr");
-  return kws.some(k => t.includes(k));
-}
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// WhatsApp’a mesaj gönder
-async function sendWhatsAppText(to, body) {
-  const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
-  const payload = {
+// Kullanıcıların günlük limitlerini tut
+let userLimits = {};
+const DAILY_LIMIT = 5;
+
+// Beekeeper Buddy promptu
+const systemPrompt = `
+Sen Beekeeper Buddy isimli sıcak ve samimi bir arıcılık asistanısın. 
+Sadece arıcılıkla ilgili konularda yardımcı ol, konuların dışına çıkma. 
+Yanıtlarında dostça, samimi bir üslup kullan ve gerektiğinde pratik ipuçları ver. 
+Kısa ve net anlat ama gerektiğinde detaylı tavsiyeler de sun. 
+Arıcılık dışı sorulara: "Üzgünüm 🐝, bu konuda yardımcı olamıyorum." diye cevap ver.
+`;
+
+// Webhook doğrulama
+app.get("/api/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
+// Webhook mesajları
+app.post("/api/webhook", async (req, res) => {
+  try {
+    const entry = req.body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+    const message = value?.messages?.[0];
+
+    if (message && message.type === "text") {
+      const from = message.from;
+      const text = message.text.body;
+
+      // Kullanıcı limit kontrolü
+      const today = new Date().toISOString().split("T")[0];
+      if (!userLimits[from]) userLimits[from] = { date: today, count: 0 };
+      if (userLimits[from].date !== today) {
+        userLimits[from] = { date: today, count: 0 };
+      }
+      if (userLimits[from].count >= DAILY_LIMIT) {
+        await sendMessage(from, "Bugünlük soru hakkınızı doldurdunuz 🐝 Yarın tekrar deneyin!");
+        return res.sendStatus(200);
+      }
+
+      // OpenAI'den cevap al
+      let reply = "";
+      try {
+        const completion = await client.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: text }
+          ],
+        });
+        reply = completion.choices[0].message.content.trim();
+      } catch (error) {
+        console.error("OpenAI error:", error);
+        reply = "Üzgünüm 🐝 şu an yoğunluktan dolayı cevap veremiyorum.";
+      }
+
+      userLimits[from].count += 1;
+      await sendMessage(from, reply);
+    }
+
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("Webhook error:", error);
+    res.sendStatus(500);
+  }
+});
+
+// WhatsApp mesaj gönderme fonksiyonu
+async function sendMessage(to, text) {
+  const url = `https://graph.facebook.com/v17.0/${process.env.PHONE_NUMBER_ID}/messages`;
+
+  const body = {
     messaging_product: "whatsapp",
     to,
-    text: { body }
+    type: "text",
+    text: { body: text },
   };
 
-  const res = await fetch(url, {
+  await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${META_TOKEN}`,
+      "Authorization": `Bearer ${META_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
-
-  if (!res.ok) {
-    const errTxt = await res.text().catch(() => "");
-    console.error("WA send error:", res.status, errTxt);
-  }
 }
 
-// OpenAI’den arıcılık yanıtı al
-async function getBeeReply(userText) {
-  const sys =
-    "Sen Beekeeper Buddy adlı uzman bir ARICILIK asistanısın. " +
-    "Kısa ve net, sahada uygulanabilir, güvenli öneriler ver. " +
-    "Riskli durumlarda koruyucu ekipman ve yerel mevzuat uyarıları ekle.";
-
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.4,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: userText },
-    ],
-  });
-
-  return resp.choices?.[0]?.message?.content?.trim() || "Bir şeyler ters gitti.";
-}
-
-// Vercel Node runtime
-export default async function handler(req, res) {
-  try {
-    // 1) META Webhook doğrulaması (GET)
-    if (req.method === "GET") {
-      const mode = req.query["hub.mode"];
-      const token = req.query["hub.verify_token"];
-      const challenge = req.query["hub.challenge"];
-
-      if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        return res.status(200).send(challenge);
-      }
-      return res.status(403).send("Forbidden");
-    }
-
-    // 2) Mesaj işleme (POST)
-    if (req.method === "POST") {
-      const body = req.body || {};
-      if (body.object !== "whatsapp_business_account") {
-        // Meta bazen farklı pingler atabilir
-        return res.status(200).json({ received: true });
-      }
-
-      const entries = body.entry || [];
-      for (const entry of entries) {
-        const changes = entry.changes || [];
-        for (const change of changes) {
-          const messages = change.value?.messages || [];
-          for (const message of messages) {
-            const from = message.from;                // gönderen
-            const text = message.text?.body || "";    // gelen metin
-
-            console.log("Incoming:", { from, text });
-
-            // Konu filtresi
-            if (!isBeeTopic(text)) {
-              await sendWhatsAppText(
-                from,
-                "Üzgünüm 🙏 Bu bot sadece arıcılık hakkında yardımcı oluyor. " +
-                "Arılar, kovan yönetimi, varroa, bal ve benzeri konuları sorabilir misin?"
-              );
-              continue;
-            }
-
-            // OpenAI yanıtı
-            try {
-              const answer = await getBeeReply(text);
-              await sendWhatsAppText(from, answer);
-            } catch (err) {
-              // Limit/bakiye/diğer hatalarda fallback
-              const msg429 =
-                "Şu an yoğunluktan dolayı cevap veremiyorum, lütfen biraz sonra tekrar dener misin? 🐝";
-              console.error("OpenAI error:", err?.status || "", err?.message || err);
-              await sendWhatsAppText(from, msg429);
-            }
-          }
-        }
-      }
-
-      return res.status(200).json({ status: "ok" });
-    }
-
-    return res.status(405).send("Method Not Allowed");
-  } catch (err) {
-    console.error("Webhook fatal:", err);
-    return res.status(500).send("Internal Server Error");
-  }
-}
-
-// Vercel body parser açık kalsın
-export const config = { api: { bodyParser: true } };
+app.listen(3000, () => {
+  console.log("Webhook server is running on port 3000");
+});
