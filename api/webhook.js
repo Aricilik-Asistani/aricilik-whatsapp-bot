@@ -51,15 +51,18 @@ app.post("/api/webhook", async (req, res) => {
       const text = message.text.body;
 
       // Kullanıcı limit kontrolü
-      const today = new Date().toISOString().split("T")[0];
-      if (!userLimits[from]) userLimits[from] = { date: today, count: 0 };
-      if (userLimits[from].date !== today) {
-        userLimits[from] = { date: today, count: 0 };
-      }
-      if (userLimits[from].count >= DAILY_LIMIT) {
-        await sendMessage(from, "Bugünlük soru hakkınızı doldurdunuz 🐝 Yarın tekrar deneyin!");
-        return res.sendStatus(200);
-      }
+ const today = new Date().toISOString().split("T")[0];
+if (!userLimits[from]) userLimits[from] = { date: today, count: 0 };
+if (userLimits[from].date !== today) {
+  userLimits[from] = { date: today, count: 0 };
+}
+if (userLimits[from].count >= DAILY_LIMIT) {
+  await sendMessage(
+    from,
+    "Bugünlük soru hakkınızı doldurdunuz 🐝 Yarın tekrar deneyin!"
+  );
+  return res.sendStatus(200);
+}
 
       // OpenAI'den cevap al
       let reply = "";
