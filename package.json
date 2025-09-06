@@ -1,11 +1,8 @@
 {
   "name": "aricilik-whatsapp-bot",
   "version": "1.0.0",
-  "description": "Arıcılık Asistanı - WhatsApp botu",
   "type": "module",
-  "engines": {
-    "node": "22.x"
-  },
+  "engines": { "node": "22.x" },
   "dependencies": {
     "openai": "^4.56.0"
   }
