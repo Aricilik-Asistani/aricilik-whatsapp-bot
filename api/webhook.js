@@ -1,46 +1,39 @@
 // api/webhook.js
 import OpenAI from "openai";
 
-// ==== ENV ====
-const {
-  META_TOKEN,
-  PHONE_NUMBER_ID,
-  VERIFY_TOKEN,
-  OPENAI_API_KEY,
-} = process.env;
+// ---- ENV ----
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const META_TOKEN = process.env.META_TOKEN;                 // 60 günlük veya sistem kullanıcısı token
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;       // WhatsApp test/gerçek numarasının ID'si
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DAILY_LIMIT = Number(process.env.DAILY_LIMIT || 5);
 
-// === Basit guardlar (deploy öncesi eksikleri yakalamak için) ===
-function must(env, name) {
-  if (!env) throw new Error(`Missing ENV: ${name}`);
-}
-must(META_TOKEN, "META_TOKEN");
-must(PHONE_NUMBER_ID, "PHONE_NUMBER_ID");
-must(VERIFY_TOKEN, "VERIFY_TOKEN");
-must(OPENAI_API_KEY, "OPENAI_API_KEY");
-
-// ==== OpenAI ====
+// ---- OpenAI ----
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ==== Idempotency: Aynı message.id'yi 1 saat sakla ====
-const processedMessageIds = new Set();
-function rememberMessage(id) {
-  processedMessageIds.add(id);
-  setTimeout(() => processedMessageIds.delete(id), 60 * 60 * 1000);
-}
+// ---- In-memory rate limit ve idempotency (server yeniden başlarsa sıfırlanır) ----
+/** userLimits[waNumber] = { date: 'YYYY-MM-DD', count: number } */
+const userLimits = {};
+/** seenMessages[waMsgId] = true  (aynı mesaj tekrar gelirse cevaplama) */
+const seenMessages = {};
 
-// ==== Günlük limit storage (in-memory) ====
-const DAILY_LIMIT = 5;
-const userLimits = {}; // { [from]: { date: 'YYYY-MM-DD', count: number } }
+// ---- Yardımcılar ----
+const json = (res, status, obj) => {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(obj));
+};
 
-// ==== Yardımcı: WhatsApp mesaj gönder ====
-async function sendMessage(to, text) {
-  const url = `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`;
+async function sendWhatsAppText(to, text) {
+  const url = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
   const body = {
     messaging_product: "whatsapp",
     to,
+    type: "text",
     text: { body: text },
   };
-  const res = await fetch(url, {
+
+  const r = await fetch(url, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${META_TOKEN}`,
@@ -49,129 +42,154 @@ async function sendMessage(to, text) {
     body: JSON.stringify(body),
   });
 
-  if (!res.ok) {
-    const err = await res.text().catch(() => "");
-    console.error("WA send error:", res.status, err);
+  if (!r.ok) {
+    const err = await r.text().catch(() => "");
+    console.error("WA send error:", r.status, err);
+    throw new Error(`WA_SEND_${r.status}`);
   }
 }
 
-// ==== Yardımcı: Konu filtresi (arıcılık dışını ele) ====
-const ARICILIK_KELIMELERI = [
-  "arı", "arıcılık", "kovan", "ana arı", "ballık", "yavru",
-  "oğul", "kestane balı", "nektar", "propolis", "varroa",
-  "polen", "temel petek", "arı sütü", "flora", "bal", "petek"
-];
-
-function isAricilikKapsami(text) {
-  const t = (text || "").toLowerCase();
-  return ARICILIK_KELIMELERI.some(k => t.includes(k));
+// sadece arıcılık konuları
+function isBeekeepingRelated(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  const keywords = [
+    "arı", "arıcılık", "kovan", "petek", "bal", "ana arı", "oğul",
+    "varroa", "nektar", "yavru", "çerçeve", "kışlatma", "koloni",
+    "kek", "şurup", "kovanı", "kovandan", "kovana", "kat at", "besleme"
+  ];
+  return keywords.some(k => t.includes(k));
 }
 
-// ==== OpenAI cevabı üret ====
-async function generateBeeKeeperReply(userText) {
-  const system = `Sen "Arıcılık Asistanı" (Beekeeper Buddy) adında sıcak, samimi bir uzmansın.
-- Sadece arıcılık/arı sağlığı/kovan yönetimi konularında cevap ver.
-- Kısa, net, uygulanabilir öneriler ver. Gerektiğinde madde madde yaz.
-- Kimyasal kullanımında dikkatli ol, güvenlik uyarıları ekle.
-- Üslup: sıcak, destekleyici, emojiyi aşırı kaçmadan kullan (🐝 uygun).`;
+async function getBeekeeperAnswer(userText) {
+  const sys = `Sen "Beekeeper Buddy" adlı samimi bir arıcılık asistanısın.
+- Cevapları kısa, açık ve uygulanabilir adımlarla ver.
+- Gerektiğinde maddeler kullan (1-2-3).
+- Tehlikeli durumlarda uyar.
+- Tamamen arıcılık dışı konulara girme.`;
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.4,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: userText }
-    ],
-  });
+  const messages = [
+    { role: "system", content: sys },
+    { role: "user", content: userText }
+  ];
 
-  const content = completion.choices?.[0]?.message?.content?.trim();
-  return content || "Bu konuda yardımcı olamadım, soruyu biraz daha açabilir misin? 🐝";
-}
-
-// ==== Vercel API Route ====
-export default async function handler(req, res) {
   try {
-    // --- GET: Webhook doğrulama ---
-    if (req.method === "GET") {
-      const mode = req.query["hub.mode"];
-      const token = req.query["hub.verify_token"];
-      const challenge = req.query["hub.challenge"];
-
-      if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        return res.status(200).send(challenge);
-      }
-      return res.sendStatus(403);
+    const out = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.4,
+      messages
+    });
+    return (out?.choices?.[0]?.message?.content || "").trim();
+  } catch (err) {
+    console.error("OpenAI error:", err?.status, err?.message);
+    // Kota/429 gibi durumlarda kullanıcıya nazik mesaj
+    if (err?.status === 429) {
+      return "Şu an yoğunluk nedeniyle cevap veremiyorum. Lütfen biraz sonra tekrar dener misiniz? 🐝";
     }
+    return "Beklenmeyen bir hata oluştu, lütfen tekrar deneyin. 🐝";
+  }
+}
 
-    // --- POST: WhatsApp webhook events ---
-    if (req.method === "POST") {
+function handleRateLimit(from) {
+  const today = new Date().toISOString().split("T")[0];
+  if (!userLimits[from]) userLimits[from] = { date: today, count: 0 };
+  if (userLimits[from].date !== today) {
+    userLimits[from] = { date: today, count: 0 };
+  }
+  return userLimits[from];
+}
+
+// ---- Vercel handler ----
+export default async function handler(req, res) {
+  // --- GET: Webhook doğrulama ---
+  if (req.method === "GET") {
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
+    if (mode === "subscribe" && token === VERIFY_TOKEN) {
+      res.statusCode = 200;
+      res.end(challenge);
+    } else {
+      res.statusCode = 403;
+      res.end("Forbidden");
+    }
+    return;
+  }
+
+  // --- POST: WhatsApp Webhook ---
+  if (req.method === "POST") {
+    try {
       const body = req.body || {};
-      // WhatsApp Cloud API yapısı: entry[0].changes[0].value
-      const entry = body.entry?.[0];
-      const change = entry?.changes?.[0];
+
+      // Meta bazen boş keepalive gönderir
+      if (!body.entry || !Array.isArray(body.entry)) {
+        return json(res, 200, { status: "ignored" });
+      }
+
+      const change = body.entry[0]?.changes?.[0];
       const value = change?.value;
-
-      // status güncellemelerini atla
-      if (value?.statuses?.length) {
-        return res.sendStatus(200);
-      }
-
       const msg = value?.messages?.[0];
+
+      // Sadece gerçek mesajları ele al
       if (!msg || msg.type !== "text") {
-        // sadece text'e yanıtlıyoruz
-        return res.sendStatus(200);
+        return json(res, 200, { status: "ignored" });
       }
 
-      // Aynı mesaj ikinci kez gelirse cevaplama
-      if (processedMessageIds.has(msg.id)) {
-        return res.sendStatus(200);
-      }
-      rememberMessage(msg.id);
-
-      const from = msg.from;                 // müşteri numarası
+      const waMsgId = msg.id;
+      const from = msg.from; // örn: "905xxxxxxxxx"
       const text = msg.text?.body?.trim() || "";
 
-      let reply = null;
+      // --- İdempotency: Aynı mesajı ikinci kez cevaplama ---
+      if (seenMessages[waMsgId]) {
+        return json(res, 200, { status: "duplicate_ignored" });
+      }
+      seenMessages[waMsgId] = true;
 
-      // 1) Konu filtresi (arıcılık dışı ise tek yanıt)
-      if (!isAricilikKapsami(text)) {
-        reply = "Üzgünüm, ben sadece arıcılık konusunda yardımcı olabilirim 🐝";
+      // --- Günlük limit kontrolü (erken çıkış) ---
+      const lt = handleRateLimit(from);
+      if (lt.count >= DAILY_LIMIT) {
+        await sendWhatsAppText(
+          from,
+          "🐝 Günlük soru limitiniz dolmuştur. Yarın yeniden deneyebilirsiniz."
+        );
+        return json(res, 200, { status: "limit_reached" }); // <-- ERKEN RETURN
       }
 
-      // 2) Limit kontrolü (sadece konu içi ise uygula)
-      if (!reply) {
-        const today = new Date().toISOString().split("T")[0];
-        if (!userLimits[from]) userLimits[from] = { date: today, count: 0 };
-        if (userLimits[from].date !== today) {
-          userLimits[from] = { date: today, count: 0 };
-        }
-
-        if (userLimits[from].count >= DAILY_LIMIT) {
-          reply = "🐝 Günlük soru limitiniz dolmuştur. Yarın yeniden deneyebilirsiniz.";
-        } else {
-          // OpenAI çağrısı
-          try {
-            reply = await generateBeeKeeperReply(text);
-            userLimits[from].count += 1; // sadece AI cevabı yollandıysa arttır
-          } catch (e) {
-            console.error("OpenAI error:", e?.status || "", e?.message || e);
-            reply = "Şu an yoğunluktan dolayı yanıt veremiyorum, lütfen biraz sonra tekrar dener misiniz? 🐝";
-          }
-        }
+      // --- Konu filtresi: arıcılık dışı ise nazik red + erken çıkış ---
+      if (!isBeekeepingRelated(text)) {
+        await sendWhatsAppText(
+          from,
+          "Üzgünüm, ben sadece arıcılık konusunda yardımcı olabilirim 🐝"
+        );
+        return json(res, 200, { status: "non_beekeeping" }); // <-- ERKEN RETURN
       }
 
-      // 3) Tek seferde gönder
-      if (reply) {
-        await sendMessage(from, reply);
-      }
+      // --- OpenAI cevabı ---
+      const answer = await getBeekeeperAnswer(text);
 
-      return res.sendStatus(200);
+      // --- WhatsApp’a gönder ---
+      await sendWhatsAppText(from, answer);
+
+      // --- Sayaç +1 ---
+      lt.count += 1;
+
+      return json(res, 200, { status: "ok" });
+    } catch (err) {
+      console.error("Webhook POST error:", err);
+      return json(res, 200, { status: "handled_with_error" }); // 200 dön ki Meta yeniden denemesin
     }
-
-    // Diğer metodlar
-    return res.sendStatus(405);
-  } catch (err) {
-    console.error("Webhook fatal error:", err);
-    return res.sendStatus(500);
   }
+
+  // Diğer metotlar
+  res.statusCode = 405;
+  res.end("Method Not Allowed");
 }
+
+// Vercel’in JSON body’yi parse etmesi için
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "2mb",
+    },
+  },
+};
