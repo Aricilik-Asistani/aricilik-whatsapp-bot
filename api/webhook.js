@@ -1,61 +1,67 @@
-import express from "express";
-import bodyParser from "body-parser";
-import fetch from "node-fetch";
+import OpenAI from "openai";
 
-const app = express();
-app.use(bodyParser.json());
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-// Token artık environment variable’dan okunuyor
-const WHATSAPP_TOKEN = process.env.META_TOKEN; 
-const VERIFY_TOKEN = "aricilik_verify"; // kendi belirlediğin verify token
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_TOKEN = process.env.META_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 // Kullanıcı başına günlük limit
 const DAILY_LIMIT = 5;
-let userLimits = {};
+const userLimits = {};
 
-async function sendMessage(to, message) {
-  await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+async function sendWhatsAppText(to, text) {
+  const url = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       messaging_product: "whatsapp",
       to,
-      text: { body: message }
-    })
+      text: { body: text },
+    }),
   });
+
+  if (!res.ok) {
+    const err = await res.text();
+    console.error("WA send error:", err);
+  } else {
+    console.log("WA send ok:", await res.json());
+  }
 }
 
-// Webhook doğrulama
-app.get("/api/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
+export default async function handler(req, res) {
+  if (req.method === "GET") {
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
 
-  if (mode && token) {
-    if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      console.log("WEBHOOK_VERIFIED");
-      res.status(200).send(challenge);
+    if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
+      console.log("Webhook verified");
+      return res.status(200).send(challenge);
     } else {
-      res.sendStatus(403);
+      return res.sendStatus(403);
     }
   }
-});
 
-// Mesajları yakalama
-app.post("/api/webhook", async (req, res) => {
-  try {
-    const entry = req.body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const messages = changes?.value?.messages;
+  if (req.method === "POST") {
+    try {
+      const entry = req.body?.entry?.[0];
+      const changes = entry?.changes?.[0];
+      const message = changes?.value?.messages?.[0];
+      const from = message?.from;
+      const text = message?.text?.body;
 
-    if (messages && messages[0]) {
-      const from = messages[0].from;
-      const text = messages[0].text?.body;
+      if (!from || !text) {
+        return res.sendStatus(200);
+      }
 
-      // Günlük limit kontrolü
+      // --- Günlük limit kontrolü ---
       const today = new Date().toISOString().split("T")[0];
       if (!userLimits[from]) userLimits[from] = { date: today, count: 0 };
       if (userLimits[from].date !== today) {
@@ -63,20 +69,43 @@ app.post("/api/webhook", async (req, res) => {
       }
 
       if (userLimits[from].count >= DAILY_LIMIT) {
-        await sendMessage(from, "🐝 Günlük soru limitiniz dolmuştur. Yarın yeniden deneyebilirsiniz.");
+        await sendWhatsAppText(from, "🐝 Günlük soru limitiniz dolmuştur. Yarın yeniden deneyebilirsiniz.");
         return res.sendStatus(200);
       }
 
       userLimits[from].count++;
 
-      // Burada OpenAI cevabı eklenecek
-      await sendMessage(from, `📩 Mesajınız alındı: "${text}"`);
-    }
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.sendStatus(500);
-  }
-});
+      // --- Arıcılık dışı mesaj kontrolü ---
+      const lower = text.toLowerCase();
+      const keywords = ["arı", "bal", "kovan", "arıcılık", "arılar"];
+      const isBeekeeping = keywords.some(k => lower.includes(k));
+      if (!isBeekeeping) {
+        await sendWhatsAppText(from, "🐝 Bu asistan sadece **arıcılık** hakkında yardımcı olabilir. Lütfen sorularınızı bu konuyla ilgili sorun.");
+        return res.sendStatus(200);
+      }
 
-app.listen(3000, () => console.log("Webhook server is running"));
+      // --- OpenAI'den cevap alma ---
+      const completion = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "Sen bir arıcılık asistanısın. Adın 'Beekeeper Buddy'. Kullanıcılara sıcak, samimi bir dille yalnızca arıcılık hakkında bilgi ver. Konu dışı sorular gelirse nazikçe 'Üzgünüm, ben sadece arıcılık konusunda yardımcı olabilirim 🐝' diye yanıtla." },
+          { role: "user", content: text },
+        ],
+      });
+
+      const reply = completion.choices[0].message?.content || "🐝 Şu an cevap veremiyorum.";
+      await sendWhatsAppText(from, reply);
+
+      return res.sendStatus(200);
+    } catch (err) {
+      console.error("Webhook error:", err);
+      return res.sendStatus(500);
+    }
+  }
+
+  return res.sendStatus(404);
+}
+
+export const config = {
+  api: { bodyParser: true },
+};
