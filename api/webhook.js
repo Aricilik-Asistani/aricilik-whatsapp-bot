@@ -1,218 +1,162 @@
-// /api/webhook.js
-// Node 22 + Vercel Serverless
-
+// api/webhook.js
+import express from "express";
+import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// --- ENV ---
+const VERIFY_TOKEN   = process.env.VERIFY_TOKEN;   // Meta verification
+const META_TOKEN     = process.env.META_TOKEN;     // Kalıcı/60g access token
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // OpenAI key
 
-// ====== CONFIG ======
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "aricilik123";
-const META_TOKEN   = process.env.META_TOKEN; // Graph API token (60 günlük veya kalıcı)
-const DAILY_LIMIT  = 5;                      // Kişi başı günlük soru hakkı
-const COOLDOWN_MS  = 15_000;                 // Flood koruması: aynı kişiye min. 15sn'de bir cevap
-const IDEMP_TTL_MS = 24 * 60 * 60 * 1000;    // 24 saat idempotency TTL
-// =====================
+// --- OpenAI (gpt-4o-mini) ---
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Bellek içi (serverless instance başına) basit depolar
-const userLimits = new Map();   // phone -> { date, count, lastReplyAt, limitNotified }
-const seenWamids = new Map();   // wamid -> timestamp
+// --- App ---
+const app = express();
+app.use(bodyParser.json());
 
+// ========== Idempotency & eski mesaj koruması ==========
+const processed = new Set();
+const SEEN_TTL_MS = 10 * 60 * 1000; // 10 dk: aynı id gelirse görmezden gel
+function remember(id) {
+  processed.add(id);
+  setTimeout(() => processed.delete(id), SEEN_TTL_MS);
+}
+// ========================================================
+
+// ========== Günlük limit ==========
+const DAILY_LIMIT = 5;
+const userLimits = {}; // { phone: { date: 'YYYY-MM-DD', count: N } }
+// ========================================================
+
+// ========== Yardımcılar ==========
 function todayStr() {
   return new Date().toISOString().split("T")[0];
 }
 
-function cleanupIdempotency() {
-  const now = Date.now();
-  for (const [id, ts] of seenWamids.entries()) {
-    if (now - ts > IDEMP_TTL_MS) seenWamids.delete(id);
-  }
-}
-
-function markSeen(wamid) {
-  cleanupIdempotency();
-  seenWamids.set(wamid, Date.now());
-}
-
-function alreadySeen(wamid) {
-  cleanupIdempotency();
-  return seenWamids.has(wamid);
-}
-
-function canReplyNow(from) {
-  const rec = userLimits.get(from);
-  if (!rec) return true;
-  if (!rec.lastReplyAt) return true;
-  return Date.now() - rec.lastReplyAt > COOLDOWN_MS;
-}
-
-function bumpUsage(from) {
-  const d = todayStr();
-  const rec = userLimits.get(from) || { date: d, count: 0, limitNotified: false, lastReplyAt: 0 };
-  if (rec.date !== d) {
-    rec.date = d;
-    rec.count = 0;
-    rec.limitNotified = false;
-  }
-  rec.count += 1;
-  rec.lastReplyAt = Date.now();
-  userLimits.set(from, rec);
-  return rec;
-}
-
-function getUsage(from) {
-  const d = todayStr();
-  const rec = userLimits.get(from) || { date: d, count: 0, limitNotified: false, lastReplyAt: 0 };
-  if (rec.date !== d) {
-    rec.date = d;
-    rec.count = 0;
-    rec.limitNotified = false;
-  }
-  userLimits.set(from, rec);
-  return rec;
+function isBeeTopic(text = "") {
+  const t = text.toLowerCase();
+  // Arıcılık ile ilgili basit anahtarlar
+  const keys = [
+    "arı", "aricilik", "arıcılık", "kovan", "bal", "ana arı", "işçi arı",
+    "oğul", "nektar", "polen", "varroa", "propolis", "arı sütü", "kovanı",
+    "çerçeve", "yavru", "petek", "kestane balı", "karniyol", "kafkas"
+  ];
+  return keys.some(k => t.includes(k));
 }
 
 async function sendMessage(phoneNumberId, to, text) {
+  // Cloud API: POST /v{ver}/PHONE_NUMBER_ID/messages
   const url = `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`;
-  const payload = {
+  const body = {
     messaging_product: "whatsapp",
     to,
     text: { body: text },
   };
-
-  const resp = await fetch(url, {
+  const r = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${META_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
 
-  // Meta hata verirse logla ama webhook'u kilitleme
-  if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    console.error("WA send error:", resp.status, t);
+  if (!r.ok) {
+    const e = await r.text().catch(() => "");
+    console.error("WA send error:", r.status, e);
   }
 }
 
-function isBeekeepingQuestion(text) {
-  // basit konu filtresi — Türkçe anahtar kelimeler
-  const kw = [
-    "arı", "kovan", "bal", "ana arı", "işçi arı", "arı sütü",
-    "kovan", "varroa", "petek", "nektar", "arı hastalığı", "arıcılık"
-  ];
-  const lower = (text || "").toLowerCase();
-  return kw.some(k => lower.includes(k));
+async function askOpenAI(prompt) {
+  const sys = `Sen "Beekeeper Buddy" adlı sıcak, samimi bir arıcılık asistanısın.
+Kısa, net, uygulanabilir ve nazik cevap ver. Gereksiz uzun yazma.
+Güvenlik/sağlık risklerinde dikkat uyarıları ekle. Madde işaretleri sevilebilir.
+Sadece arıcılık konularına cevap ver.`;
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: sys },
+      { role: "user",   content: prompt }
+    ],
+    temperature: 0.3,
+  });
+
+  return resp.choices?.[0]?.message?.content?.trim() || "Bir cevap oluşturulamadı.";
 }
+// ========================================================
 
-function beekeeperPrompt(userText) {
-  return `Sen "Beekeeper Buddy" adlı sıcak, samimi bir arıcılık asistanısın.
-Kısa, net ve uygulanabilir cevaplar ver. Madde işaretleri kullan.
-Emojiyi abartma ama ara sıra 🐝 kullanabilirsin.
-Konu arıcılık dışına çıkarsa yardımcı olamayacağını kibarca söyle ve tekrar arıcılık sorusu iste.
+// ========== GET: Webhook doğrulama ==========
+app.get("/api/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
 
-Kullanıcının sorusu: """${userText}"""`;
-}
-
-export default async function handler(req, res) {
-  // ----- GET: Webhook doğrulama -----
-  if (req.method === "GET") {
-    const mode  = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
-    const chal  = req.query["hub.challenge"];
-    if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      return res.status(200).send(chal);
-    }
-    return res.sendStatus(403);
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
   }
+  return res.sendStatus(403);
+});
 
-  // ----- POST: Bildirim -----
-  if (req.method !== "POST") return res.sendStatus(405);
-
+// ========== POST: Mesaj al ==========
+app.post("/api/webhook", async (req, res) => {
   try {
-    const body = req.body;
-    // Meta beklenen yapıda mı?
-    const entry = body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
+    const change = req.body?.entry?.[0]?.changes?.[0];
+    const value  = change?.value;
+    const msg    = value?.messages?.[0];
 
-    // Sadece mesaj eventlerini işleyelim
-    const messages = value?.messages;
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      // status vs. ise sessizce 200 dön
+    // Sadece text mesajları işle
+    if (!msg || msg.type !== "text") return res.sendStatus(200);
+
+    // ---- Anti-stale: 5 dakikadan eskiyse atla
+    const MAX_AGE_SEC = 5 * 60;
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (nowSec - Number(msg.timestamp || 0) > MAX_AGE_SEC) {
       return res.sendStatus(200);
     }
 
-    const phoneNumberId = value?.metadata?.phone_number_id; // Gönderim için gerekli
-    const message = messages[0];
+    // ---- Anti-duplicate: aynı id'yi ikinci kez görme
+    if (processed.has(msg.id)) return res.sendStatus(200);
+    remember(msg.id);
 
-    // Idempotency: aynı wamid’i ikinci kez görürsek çık
-    const wamid = message.id;
-    if (!wamid || alreadySeen(wamid)) {
-      return res.sendStatus(200);
-    }
-    markSeen(wamid);
+    // WA alanları
+    const from = msg.from;                          // gönderen numara
+    const text = msg.text?.body?.trim() || "";      // mesaj içeriği
+    const phoneNumberId = value?.metadata?.phone_number_id; // kendi WA phone id
 
-    const from = message.from;               // "905xxxxxxxxx" formatında
-    const type = message.type;
-    const text = type === "text" ? message.text?.body : "";
+    if (!phoneNumberId || !from) return res.sendStatus(200);
 
-    // Flood koruması
-    if (!canReplyNow(from)) {
-      return res.sendStatus(200);
-    }
+    // ---- Günlük limit kontrolü
+    const t = todayStr();
+    if (!userLimits[from]) userLimits[from] = { date: t, count: 0 };
+    if (userLimits[from].date !== t) userLimits[from] = { date: t, count: 0 };
 
-    // --- Günlük limit kontrolü (cevap göndermeden ÖNCE) ---
-    const usage = getUsage(from);
-    if (usage.count >= DAILY_LIMIT) {
-      if (!usage.limitNotified) {
-        // Limit doldu uyarısını bir kez gönder
-        await sendMessage(phoneNumberId, from, "🐝 Günlük soru limitiniz dolmuştur. Yarın yeniden deneyebilirsiniz.");
-        usage.limitNotified = true;
-        userLimits.set(from, usage);
-      }
-      // Sonraki mesajlarda tamamen sessiz kal
+    if (userLimits[from].count >= DAILY_LIMIT) {
+      await sendMessage(phoneNumberId, from, "🐝 Günlük soru limitiniz dolmuştur. Yarın yeniden deneyebilirsiniz.");
       return res.sendStatus(200);
     }
 
-    // --- Konu filtresi ---
-    if (!isBeekeepingQuestion(text)) {
-      // Arıcılık dışı ise bir kez kibar uyarı gönder ve sayacı artırma
+    // ---- Konu filtresi
+    if (!isBeeTopic(text)) {
       await sendMessage(phoneNumberId, from, "Üzgünüm, ben sadece arıcılık konusunda yardımcı olabilirim 🐝");
-      usage.lastReplyAt = Date.now();
-      userLimits.set(from, usage);
       return res.sendStatus(200);
     }
 
-    // Bu noktada cevap üreteceğiz → 200’ü geciktirmemek için hızlı davran
-    // (İstersen aşağıdaki openai çağrısından önce 200 döndürüp arka planda da çalıştırabilirsin,
-    // fakat Vercel serverless’ta işlem süresi kısa olduğu sürece bu akış yeterli.)
-    const prompt = beekeeperPrompt(text);
+    // ---- OpenAI yanıtı
+    const reply = await askOpenAI(text);
 
-    let ai = "Kısa, net bir cevap üretilemedi.";
-    try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.4,
-      });
-      ai = resp.choices?.[0]?.message?.content?.trim() || ai;
-    } catch (err) {
-      console.error("OpenAI error:", err?.status || "", err?.message || err);
-      ai = "Şu an yoğunluktayız, lütfen biraz sonra tekrar deneyin 🐝";
-    }
+    // Gönder & sayaç artır
+    await sendMessage(phoneNumberId, from, reply);
+    userLimits[from].count += 1;
 
-    // WhatsApp’a gönder
-    await sendMessage(phoneNumberId, from, ai);
-
-    // Kullanım sayacı & zaman damgası
-    const updated = bumpUsage(from);
-    userLimits.set(from, updated);
-
+    // ÖNEMLİ: Burada bitir
     return res.sendStatus(200);
-  } catch (e) {
-    console.error("Webhook error:", e);
-    // Meta tekrar denemesin diye yine de 200 dönüyoruz
+  } catch (err) {
+    console.error("Webhook error:", err);
     return res.sendStatus(200);
   }
-}
+});
+
+// Vercel için
+export default app;
