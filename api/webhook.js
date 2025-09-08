@@ -69,10 +69,10 @@ async function sendMessage(phoneNumberId, to, text) {
 }
 
 async function askOpenAI(prompt) {
-  const sys = `Sen "Beekeeper Buddy" adlı sıcak, samimi bir arıcılık asistanısın.
-Kısa, net, uygulanabilir ve nazik cevap ver. Gereksiz uzun yazma.
+  const sys = `Sen "Beekeeper Buddy" gibi, "Kovan Dili" adında sıcak, samimi bir arıcılık asistanısın.
+Kısa, net, uygulanabilir ve nazik cevap ver. Gereksiz uzun yazma. Bilgilerin doğruluğundan emin ol.
 Güvenlik/sağlık risklerinde dikkat uyarıları ekle. Madde işaretleri sevilebilir.
-Sadece arıcılık konularına cevap ver.`;
+Sadece arıcılık, arı yetiştiricili, arı sağlığı; "varroa, yavru çürüğü, kireç hastalığı, arı kuşları, eşek arıları, nosema gibi" konularına doğruluğundan eminolduğun cevabı ver.`;
 
   const resp = await openai.chat.completions.create({
     model: "gpt-4o-mini",
