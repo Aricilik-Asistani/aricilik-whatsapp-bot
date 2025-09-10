@@ -2,6 +2,10 @@
   "name": "aricilik-whatsapp-bot",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": "22.x" },
-  "dependencies": {}
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "openai": "^4.0.0"
+  }
 }
